@@ -1,21 +1,62 @@
 #! /usr/bin/python
 #
 # * mkvfx
-# * https://github.com/meshula/mkvfx
+# * https://github.com/vfxpro99/mkvfx
 # *
 # * Copyright 2016 Nick Porcino
-# * Licensed under the BSD 2 clause license.
+# * Licensed under the Apache 2 license.
+
+# Portions of this code are from Pixar's build_usd.py script and are
+# subject to this license:
+
+#
+# Copyright 2017 Pixar
+#
+# Licensed under the Apache License, Version 2.0 (the "Apache License")
+# with the following modification; you may not use this file except in
+# compliance with the Apache License and the following modification to it:
+# Section 6. Trademarks. is deleted and replaced with:
+#
+# 6. Trademarks. This License does not grant permission to use the trade
+#    names, trademarks, service marks, or product names of the Licensor
+#    and its affiliates, except as required to comply with Section 4(c) of
+#    the License and to reproduce the content of the NOTICE file.
+#
+# You may obtain a copy of the Apache License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the Apache License with the above modification is
+# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the Apache License for the specific
+# language governing permissions and limitations under the Apache License.
+#
 
 import argparse
+import contextlib
+import datetime
 import json
 import os
+import multiprocessing
 import platform
+import shlex
+import shutil
 import subprocess
 import sys
 import time
+import tarfile
+import urllib2
+import zipfile
 
-version = "0.2.0"
+from distutils.spawn import find_executable
+
+version = "0.3.0"
 print "mkvfx", version
+
+MSVC_2017_COMPILER_VERSION = 10
+MSVC_2017_TOOLSET = '14.1'
+
 
 #-----------------------------------------------------
 # Command line options
@@ -36,6 +77,15 @@ lower_case_map = {}
 built_packages = []
 package_recipes = {}
 to_build = []
+recipes_file = ""       # @TODO read from command line
+
+build_platform = ""
+platform_compiler = ""
+
+cwd = ""
+home = ""
+mkvfx_root = ""
+mkvfx_build_root = ""
 
 def print_help():
     global package_recipes, build_platform
@@ -48,112 +98,166 @@ def print_help():
             print ' ', package_recipes[p]['name']
     print "\nNote that git repos are shallow cloned.\n"
 
-class RecordLibAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        global to_build
-        to_build = values;
+# Helpers for printing output
+verbosity = 1
 
-cl_parser = argparse.ArgumentParser(description='mkvfx')
-cl_parser.add_argument('lib', action=RecordLibAction, nargs='*', help="library to build")
-cl_parser.add_argument('-nf', '--nofetch', dest='nofetch', action='store_const', const=1, default=0, help="don't fetch repository")
-cl_parser.add_argument('-nb', '--nobuild', dest='nobuild', action='store_const', const=1, default=0, help="don't build")
-cl_parser.add_argument('-nd', '--nodependencies', dest='nodependencies', action='store_const', const=1, default=0, help="don't process dependencies")
-cl_parser.add_argument('-nfd', dest='nfd', action='store_const', const=1, default=0, help="don't fetch repository or process dependencies")
-cl_parser.add_argument('-ni', '--noinstall', dest='noinstall', action='store_const', const=1, default=0, help="don't install")
-cl_parser.add_argument('-a', '--all', dest='all', action='store_const', const=1, default=0, help="process everything in the recipe file")
-cl_parser.add_argument('--force', dest='force', action='store_const', const=1, default=0, help="force rebuild")
-args = cl_parser.parse_args()
+def Print(msg):
+    if verbosity > 0:
+        print msg
 
-if args.nofetch or args.nfd:
-    option_do_fetch = 0
-if args.nobuild:
-    option_do_build = 0
-if args.nodependencies or args.nfd:
-    option_do_dependencies = 0
-if args.noinstall:
-    option_do_install = 0
-if args.all:
-    option_build_all = 1
-if args.force:
-    option_force_build = 1
+def PrintStatus(status):
+    if verbosity >= 1:
+        print "STATUS:", status
 
-#-----------------------------------------------------
-# Platform detection
-#-----------------------------------------------------
+def PrintInfo(info):
+    if verbosity >= 2:
+        print "INFO:", info
 
-# when other platforms are tested, this should be a platform detection block
-# resolving to recipe_osx, recipe_darwin, recipe_linux, recipe_windows, recipe_ios, etc.
-build_platform = ""
-platform_compiler = ""
-recipes_file = ""       # @TODO read from command line
+def PrintCommandOutput(output):
+    if verbosity >= 3:
+        sys.stdout.write(output)
 
-if platform.system() == "Darwin":
-    build_platform = "osx"
-    platform_compiler = "clang"
-    recipes_file = "recipes-osx64.json"
+def PrintError(error):
+    print "ERROR:", error
 
-if platform.system() == "Windows":
-    if not 'DXSDK_DIR' in os.environ:
-        os.environ['DXSDK_DIR'] = ' ' # Some cmake recipes still believe in this obsolete variable
+# Helpers for determining platform
+def Windows():
+    return platform.system() == "Windows"
+def Linux():
+    return platform.system() == "Linux"
+def MacOS():
+    return platform.system() == "Darwin"
 
-    recipes_file = "recipes-win64.json"
-    build_platform = "windows"
-    platform_compiler = "vs2015"
+@contextlib.contextmanager
+def CurrentWorkingDirectory(dir):
+    """Context manager that sets the current working directory to the given
+    directory and resets it to the original directory when closed."""
+    curdir = os.getcwd()
+    os.chdir(dir)
+    try: yield
+    finally: os.chdir(curdir)
 
-if build_platform == "":
-    print "Platform ", platform.system(), "not supported"
-    sys.exit(1)
+def DownloadURL(url, context, force):
+    """Download and extract the archive file at given URL to the
+    source directory specified in the context. Returns the absolute 
+    path to the directory where files have been extracted."""
+    with CurrentWorkingDirectory(context.srcDir):
+        # Extract filename from URL and see if file already exists. 
+        filename = url.split("/")[-1]       
+        if force and os.path.exists(filename):
+            os.remove(filename)
 
-platform_recipe = "recipe_" + build_platform;
-platform_install = "install_" + build_platform;
-platform_dependencies = "dependencies_" + build_platform;
+        if os.path.exists(filename):
+            PrintInfo("{0} already exists, skipping download"
+                      .format(os.path.abspath(filename)))
+        else:
+            PrintInfo("Downloading {0} to {1}"
+                      .format(url, os.path.abspath(filename)))
+
+            # To work around occasional hiccups with downloading from websites
+            # (SSL validation errors, etc.), retry a few times if we don't
+            # succeed in downloading the file.
+            maxRetries = 5
+            lastError = None
+
+            # Download to a temporary file and rename it to the expected
+            # filename when complete. This ensures that incomplete downloads
+            # will be retried if the script is run again.
+            tmpFilename = filename + ".tmp"
+            if os.path.exists(tmpFilename):
+                os.remove(tmpFilename)
+
+            for i in xrange(maxRetries):
+                try:
+                    r = urllib2.urlopen(url)
+                    with open(tmpFilename, "wb") as outfile:
+                        outfile.write(r.read())
+                    break
+                except Exception as e:
+                    PrintCommandOutput("Retrying download due to error: {err}\n"
+                                       .format(err=e))
+                    lastError = e
+            else:
+                raise RuntimeError("Failed to download {url}: {err}"
+                                   .format(url=url, err=lastError))
+
+            shutil.move(tmpFilename, filename)
+
+        # Open the archive and retrieve the name of the top-most directory.
+        # This assumes the archive contains a single directory with all
+        # of the contents beneath it.
+        archive = None
+        rootDir = None
+        try:
+            if tarfile.is_tarfile(filename):
+                archive = tarfile.open(filename)
+                rootDir = archive.getnames()[0].split('/')[0]
+            elif zipfile.is_zipfile(filename):
+                archive = zipfile.ZipFile(filename)
+                rootDir = archive.namelist()[0].split('/')[0]
+            else:
+                raise RuntimeError("unrecognized archive file type")
+
+            extractedPath = os.path.abspath(rootDir)
+            if force and os.path.isdir(extractedPath):
+                shutil.rmtree(extractedPath)
+
+            if os.path.isdir(extractedPath):
+                PrintInfo("Directory {0} already exists, skipping extract"
+                          .format(extractedPath))
+            else:
+                PrintInfo("Extracting archive to {0}".format(extractedPath))
+
+                # Extract to a temporary directory then move the contents
+                # to the expected location when complete. This ensures that
+                # incomplete extracts will be retried if the script is run
+                # again.
+                tmpExtractedPath = os.path.abspath("extract_dir")
+                if os.path.isdir(tmpExtractedPath):
+                    shutil.rmtree(tmpExtractedPath)
+
+                archive.extractall(tmpExtractedPath)
+                shutil.move(os.path.join(tmpExtractedPath, rootDir),
+                            extractedPath)
+                shutil.rmtree(tmpExtractedPath)
+                
+            return extractedPath
+        except Exception as e:
+            # If extraction failed for whatever reason, assume the
+            # archive file was bad and move it aside so that re-running
+            # the script will try downloading and extracting again.
+            shutil.move(filename, filename + ".bad")
+            raise RuntimeError("Failed to extract archive {filename}: {err}"
+                               .format(filename=filename, err=e))
 
 
-#-----------------------------------------------------
-# Directory set up
-#-----------------------------------------------------
-
-cwd = os.getcwd()
 
 def userHome():
     return os.path.expanduser("~")
 
-home = userHome()
-
-mkvfx_root = cwd + "/local"
-mkvfx_source_root = home + "/mkvfx-sources"
-mkvfx_build_root = home + "/mkvfx-build"
-
 def platform_path(path):
-    return '"' + path + '"';
+    return '"' + path + '"'
 
-#-----------------------------------------------------
-# Build component dependencies
-#-----------------------------------------------------
-
-searchedFor7zip = False
-foundGit = False;
-found7zip = False
-searchedForCmake = False
-foundCmake = False
-searchedForMake = False
-foundMake = False
-searchedForPremake = False
-foundPremake4 = False
-foundPremake5 = False
-foundChocolately = False
-searchedForChocolately = False
-
-def substitute_variables(subst):
-    global mkvfx_root, mkvfx_source_root, mkvfx_build_root
+def substitute_variables(context, subst):
+    global mkvfx_root, mkvfx_build_root
+    procs = "{procs}".format(procs=multiprocessing.cpu_count())
     result = subst.replace("$(MKVFX_ROOT)", mkvfx_root)
-    result = result.replace("$(MKVFX_SRC_ROOT)", mkvfx_source_root)
+    result = result.replace("$(MKVFX_SRC_ROOT)", context.srcDir)
     result = result.replace("$(MKVFX_BUILD_ROOT)", mkvfx_build_root)
+    result = result.replace("$(PROCS)", procs)
+    result = result.replace("$(CONFIGURATION)", context.current_configuration)
 
     if result != subst:
-        return substitute_variables(result);
+        return substitute_variables(context, result)
 
     return result
+
+def substitute_variables_array(context, str_array):
+    result = []
+    for str in str_array:
+        result.append(substitute_variables(context, str))
+    return result
+
 
 def execTask(task, workingDir='.'):
     print "Running", task
@@ -175,86 +279,10 @@ def execTask(task, workingDir='.'):
     os.chdir(restore_path)
     return status
 
-
-def check_for_7zip():
-    global found7zip, searchedFor7zip
-    if found7zip:
-        return True
-    if searchedFor7zip:
-        return False
-
-    result = execTask('7z > validation_tmp.txt')
-    searchedFor7zip = True
-    found7zip = not result # because zero means success
-    return found7zip
-
-def check_for_make():
-    global foundMake, searchedForMake
-
-    if build_platform == "windows":
-        # nb: make on Windows is pretty darn sketchy at best. don't test.
-        # not existing is a successful check :\
-        return True
-
-    if foundMake:
-        return True
-    if searchedForMake:
-        return False
-
-    result = execTask('make --version')
-    searchedForMake = True
-    foundMake = not result # because 0 means success
-    return foundMake
-
-def check_for_cmake():
-    global foundCmake, searchedForCmake
-
-    if foundCmake:
-        return True
-    if searchedForCmake:
-        return False
-
-    result = execTask('cmake --version')
-    searchedForCmake = True
-    foundCmake = not result # because 0 is success
-    return foundCmake
-
-def check_for_premake():
-    global foundPremake4, foundPremake5, searchedForPremake
-
-    if foundPremake4 and foundPremake5:
-        return True
-    if searchedForPremake:
-        return False
-
-    # premake 4 returns status 1 for version, 5 returns 0 for version
-    # avoid execTask for this weird case
-    status = 1
-    try:
-        status = not subprocess.call('premake4 --version', shell=True)
-    except Exception as e:
-        status = 1
-
-    foundPremake4 = not status
-    foundPremake5 = not execTask('premake5 --version')
-
-    searchedForPremake = True
-    return foundPremake4 and foundPremake5
-
-def check_for_chocolately():
-    global foundChocolately, searchedForChocolately
-
-    if build_platform != "windows":
-        return True
-
-    if foundChocolately or searchedForChocolately:
-        return True
-
-    foundChocolately = not execTask('choco')
-    searchedForChocolately = True
-
-
 def create_directory(path):
+    if verbosity:
+        print "Creating directory:", path
+
     exists = os.path.exists(path)
     if not os.path.isdir(path):
         if exists:
@@ -275,74 +303,233 @@ def validate_tool_chain():
             print "If running Powershell, invoke PowerShell from a Visual Studio CMD prompt, using 'powershell'\n"
             sys.exit(1)
 
-    print "Validating directory structure\n"
-    create_directory(mkvfx_root)
-    create_directory(mkvfx_root + '/bin')
-    create_directory(mkvfx_root + '/include')
-    create_directory(mkvfx_root + '/lib')
-    create_directory(mkvfx_root + '/man')
-    create_directory(mkvfx_root + '/man/man1')
-    create_directory(mkvfx_source_root)
-    create_directory(mkvfx_build_root)
-
     print "Checking for tools\n"
+    notFound = []
 
-    if execTask('git --version', '.'):
-        foundGit = False
-        print "MKVFX Could not find git, please install it and try again\n"
-        #sys.exit(1)
-    else:
-        foundGit = True
+    if not find_executable("git"):
+        PrintError("git not found -- please install it and adjust your PATH")
+        notFound.append("git")
 
-    if build_platform == "windows" and not check_for_7zip():
+    if Windows() and not find_executable("7z"):
         print "MKVFX could not find 7zip, please install it and try again\n"
+        notFound.append("7z")
         #sys.exit(1)
 
-    if not check_for_make():
+    if not Windows() and not find_executable("make"):
         print "MKVFX could not find make, please install it and try again\n"
-        if build_platform == "windows":
-            print "make is available here: http://gnuwin32.sourceforge.net/packages/make.htm\n"
+        notFound.append("make")
         #sys.exit(1)
 
-    if not check_for_cmake():
+    if not find_executable("cmake"):
         print "MKVFX could not find cmake, please install it and try again\n"
+        notFound.append("cmake")
         #sys.exit(1)
 
-    if not check_for_premake():
-        if not foundPremake4:
-            print "MKVFX could not find premake4. Build steps requiring premake4 will fail.\n"
-        if not foundPremake5:
-            print "MKVFX could not find premake5. Build steps requiring premake5 will fail.\n"
+    if Windows() and not find_executable("nasm"):
+        print "MKVFX could not find nasm, build steps requiring nasm will fail\n"
+        notFound.append("nasm")
+        #sys.exit(1)
+
+    if not find_executable("premake5"):
+        print "MKVFX could not find premake5. Build steps requiring premake5 will fail.\n"
         print "Premake is available from here: http://industriousone.com/premake/download\n"
-        #sys.exit(1)
-
-    if not check_for_chocolately():
-        print "MKVFX could not find chocolately, plese install it and try again\n"
-        print "chocolately is available here: https://chocolatey.org/"
+        notFound.append("premake5")
         #sys.exit(1)
 
     print "Validation complete"
-    notFound = []
-    if not foundGit: notFound.append('git')
-    if not found7zip: notFound.append('7z')
 
-    # haven't found a viable make for msvc
-    if not build_platform == "windows":
-        if not foundMake: notFound.append('make')
-
-    if not foundPremake4: notFound.append('premake4')
-    if not foundPremake5: notFound.append('premake5')
     if len(notFound) > 1:
-        print "Some tools", notFound, "were not found, some recipes may not run"
+        print "Some tools", notFound, "were not found, some recipes may not run\n"
     elif len(notFound) > 0:
-        print "One tool", notFound, "was not found, some recipes may not run"
-    print
+        print "One tool", notFound, "was not found, some recipes may not run\n"
 
-validate_tool_chain()
+def create_directory_structure(root, src, build):
+    create_directory(root)
+    create_directory(root + '/bin')
+    create_directory(root + '/include')
+    create_directory(root + '/lib')
+    create_directory(root + '/man')
+    create_directory(root + '/man/man1')
+    create_directory(src)
+    create_directory(build)
+
+def GetVisualStudioCompilerAndVersion():
+    """Returns a tuple containing the path to the Visual Studio compiler
+    and a tuple for its version, e.g. (19, 00, 24210). If the compiler is
+    not found, returns None."""
+    if not Windows():
+        return None
+
+    msvcCompiler = find_executable('cl')
+    if msvcCompiler:
+        match = re.search(
+            "Compiler Version (\d+).(\d+).(\d+)",
+            subprocess.check_output("cl", stderr=subprocess.STDOUT))
+        if match:
+            return (msvcCompiler, tuple(int(v) for v in match.groups()))
+
+    print "Defaulting to Visual Studio 2017 as cl was not found in the environment"
+    return (19, 10) # assume Visual Studio 2017
+
+
+
+def PatchFile(filename, patches):
+    """Applies patches to the specified file. patches is a list of tuples
+    (old string, new string)."""
+    oldLines = open(filename, 'r').readlines()
+    newLines = oldLines
+    for (oldLine, newLine) in patches:
+        newLines = [s.replace(oldLine, newLine) for s in newLines]
+    if newLines != oldLines:
+        PrintInfo("Patching file {filename} (original in {oldFilename})..."
+                  .format(filename=filename, oldFilename=filename + ".old"))
+        shutil.copy(filename, filename + ".old")
+        open(filename, 'w').writelines(newLines)
+
+def Run(cmd):
+    """Run the specified command in a subprocess."""
+    print 'Running "{cmd}"'.format(cmd=cmd)
+    PrintInfo('Running "{cmd}"'.format(cmd=cmd))
+
+    with open("log.txt", "a") as logfile:
+        # Let exceptions escape from subprocess.check_output -- higher level
+        # code will handle them.
+        p = subprocess.Popen(shlex.split(cmd),
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        logfile.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        logfile.write("\n")
+        logfile.write(cmd)
+        logfile.write("\n")
+        while True:
+            l = p.stdout.readline()
+            if l != "":
+                logfile.write(l)
+                PrintCommandOutput(l)
+            elif p.poll() is not None:
+                break
+
+    if p.returncode != 0:
+        # If verbosity >= 3, we'll have already been printing out command output
+        # so no reason to print the log file again.
+        if verbosity < 3:
+            with open("log.txt", "r") as logfile:
+                Print(logfile.read())
+        raise RuntimeError("Failed to run '{cmd}'\nSee {log} for more details."
+                           .format(cmd=cmd, log=os.path.abspath("log.txt")))
+
+
+def ProjectBuildDir(buildDirRoot, projectName, force = False):
+    buildDir = os.path.join(buildDirRoot, projectName)
+    if force and os.path.isdir(buildDir):
+        shutil.rmtree(buildDir)
+
+    if not os.path.isdir(buildDir):
+        os.makedirs(buildDir)
+
+    return buildDir
+
+def RunCMake(context, srcDir, buildDirRoot, instDir, force, config, extraArgs = None):
+    """Invoke CMake to configure, build, and install a library whose
+    source code is located in srcDir."""
+    if not (config == 'Debug' or config == 'Release'):
+        raise RuntimeError("config must be Debug or Release. Found {config}".format(config=config))
+
+    context.current_configuration = config
+    buildDir = ProjectBuildDir(buildDirRoot, os.path.split(srcDir)[1], force)
+
+    # On Windows, we need to explicitly specify the generator to ensure we're
+    # building a 64-bit project.
+    if Windows():
+        msvcCompilerAndVersion = GetVisualStudioCompilerAndVersion()
+        if msvcCompilerAndVersion:
+            _, version = msvcCompilerAndVersion
+            print "version", version
+            if version >= MSVC_2017_COMPILER_VERSION:
+                generator = '-G "Visual Studio 15 2017 Win64"'
+            else:
+                generator = '-G "Visual Studio 14 2015 Win64"'
+    elif MacOS():
+        generator = '-G Xcode'
+    else:
+        generator = '-G make'
+
+    # On MacOS, enable the use of @rpath for relocatable builds.
+    osx_rpath = None
+    if MacOS():
+        osx_rpath = "-DCMAKE_MACOSX_RPATH=ON"
+
+    with CurrentWorkingDirectory(buildDir):
+        Run('cmake '
+            '-DCMAKE_INSTALL_PREFIX="{instDir}" '
+            '-DCMAKE_PREFIX_PATH="{depsInstDir}" '
+            '{osx_rpath} '
+            '{generator} '
+            '{extraArgs} '
+            '"{srcDir}"'
+            .format(instDir=instDir,
+                    depsInstDir=instDir,
+                    srcDir=srcDir,
+                    osx_rpath=(osx_rpath or ""),
+                    generator=(generator or ""),
+                    extraArgs=(" ".join(extraArgs) if extraArgs else "")))
+        Run("cmake --build . --config {config} --target install -- {multiproc}"
+            .format(config=config,
+                    multiproc=("/M:{procs}" if Windows() else "-jobs {procs}")
+                               .format(procs=multiprocessing.cpu_count())))
+
+
+def RunB2(context, srcDir, buildDirRoot, instDir, force, config, b2_settings):
+    with CurrentWorkingDirectory(srcDir):
+        buildDir = ProjectBuildDir(buildDirRoot, os.path.split(srcDir)[1], force)
+
+        bootstrap = "bootstrap.bat" if Windows() else "./bootstrap.sh"
+        Run('{bootstrap} --prefix="{instDir}"'
+            .format(bootstrap=bootstrap, instDir=instDir))
+
+        if force:
+            b2_settings.append("-a")
+
+        if Windows():
+            b2_settings.append("toolset=msvc-{toolset}".format(toolset=MSVC_2017_TOOLSET))
+            
+            # Boost 1.61 doesn't support Visual Studio 2017.  If that's what 
+            # we're using then patch the project-config.jam file to hack in 
+            # support. We'll get a lot of messages about an unknown compiler 
+            # version but it will build.
+            msvcCompilerAndVersion = GetVisualStudioCompilerAndVersion()
+            if msvcCompilerAndVersion:
+                compiler, version = msvcCompilerAndVersion
+                if version >= MSVC_2017_COMPILER_VERSION:
+                    PatchFile('project-config.jam',
+                              [('using msvc', 
+                                'using msvc : {toolset} : "{compiler}"'
+                                .format(toolset=MSVC_2017_TOOLSET, compiler=compiler))])
+
+        if MacOS():
+            # Must specify toolset=clang to ensure install_name for boost
+            # libraries includes @rpath
+            b2_settings.append("toolset=clang")
+
+        b2 = "b2" if Windows() else "./b2"
+        Run('{b2} {options} install'
+            .format(b2=b2, options=" ".join(b2_settings)))
+
+#-----------------------------------------------------
+# Build component dependencies
+#-----------------------------------------------------
 
 #-----------------------------------------------------
 # La Trattoria
 #-----------------------------------------------------
+
+def has_data(recipe, data):
+    global build_platform
+    platform_data = data + '_' + build_platform
+    if platform_data in recipe:
+        return True
+    if data in recipe:
+        return True
+    return False
 
 def get_data(recipe, data):
     global build_platform
@@ -353,30 +540,33 @@ def get_data(recipe, data):
         return recipe[data]
     return ''
 
-def runRecipe(recipe, package_name, package, dir_name, execute):
-    global mkvfx_root, mkvfx_source_root, build_platform, cwd
-
-    print "package:", package_name
-
-    build_dir = get_data(package, 'build_in')
-    if len(build_dir) == 0:
-        build_dir = mkvfx_source_root + "/" + dir_name
-
-    build_dir = substitute_variables(build_dir)
-
-    print "in directory:", build_dir
+def buildDir(context, package, dir_name):
+    build_dir = ''
+    if has_data(package, 'build_in'):
+        build_dir = get_data(package, 'build_in')
+    build_dir = os.path.join(context.srcDir, dir_name)
+    build_dir = substitute_variables(context, build_dir)
     exists = os.path.exists(build_dir)
     if not os.path.isdir(build_dir):
         if exists:
             print "Build path", build_dir, "exists, but is not a directory"
             sys.exit(1)
-
         try:
             os.makedirs(build_dir)
         except Exception as e:
-            print "Could not create build directory", build_dir, "\nfor", package_name, "because", e
-            sys.exit(1)
+            err = "Could not create build directory " + build_dir + "\nfor " + package_name + " because " + e
+            print err
+            raise RuntimeError(err)
+    return build_dir
 
+def runRecipe(context, recipe, package_name, package, dir_name, execute):
+    global mkvfx_root, build_platform, cwd
+
+    print "package:", package_name
+    build_dir = buildDir(context, package, dir_name)
+
+    print "in directory:", build_dir
+ 
     os.chdir(build_dir)
 
 	# join all lines ending in +
@@ -400,19 +590,18 @@ def runRecipe(recipe, package_name, package, dir_name, execute):
         r += 1
 
     for t in theTasks:
-        task = substitute_variables(t)
+        task = substitute_variables(context, t)
         if execute:
             execTask(task, build_dir)
         else:
             print "Simulating:", task
 
-        os.chdir(cwd);
+        os.chdir(cwd)
 
-def bake(package_name):
+def bake(context, package_name):
     global built_packages, package_recipes
     global option_do_dependencies, option_do_fetch, option_do_build, option_do_install
     global build_platform
-    global mkvfx_source_root
     global lower_case_map
 
     print "Baking", package_name
@@ -428,7 +617,7 @@ def bake(package_name):
     if option_do_dependencies:
         dependencies = get_data(recipe, 'dependencies')
         for d in dependencies:
-            bake(d)
+            bake(context, d)
 
         print "Dependencies of", package_name, "baked, moving on the entree"
 
@@ -437,12 +626,12 @@ def bake(package_name):
     	print 'No source dir specified for "', package_name, '" in recipe'
         sys.exit(1)
 
-    dir_name = substitute_variables(dir_name)
+    dir_name = substitute_variables(context, dir_name)
 
     repository = get_data(recipe, 'repository')
     if repository != '':
         print "Fetching", package_name, "from", repository
-        dir_path = mkvfx_source_root + "/" + dir_name
+        dir_path = context.srcDir + "/" + dir_name
 
         if option_do_fetch:
             url = get_data(repository, 'url')
@@ -450,53 +639,167 @@ def bake(package_name):
             if len(type) > 0 and len(url) > 0:
                 if type == "git":
                     cmd = ''
-                    if os.path.exists(dir_path):
+                    if os.path.exists(os.path.join(dir_path, ".git", "config")):
                         cmd = "git -C " + platform_path(dir_path) + " pull"
                     else:
                         branch = get_data(repository, 'branch')
                         if len(branch) > 0:
                             branch = " --branch " + repository.branch + " "
-                        cmd = "git -C " + platform_path(mkvfx_source_root) + " clone --depth 1 " + branch + url + " " + dir_name
+                        cmd = "git -C " + platform_path(context.srcDir) + " clone --depth 1 " + branch + url + " " + dir_name
                     execTask(cmd)
-                elif type == "curl-tgz":
-                    if not os.path.exists(dir_path):
-                        try:
-                            os.makedirs(dir_path)
-                        except Exception as e:
-                            print "Could not create fetch directory", dir_path, "because", e
-                            sys.exit(1)
-
-                    if build_platform == "windows":
-                        # reference http://stackoverflow.com/questions/9155289/calling-powershell-from-nodejs
-                        # reference http://blog.commandlinekungfu.com/2009/11/episode-70-tangled-web.html
-                        # reference http://stackoverflow.com/questions/1359793/programmatically-extract-tar-gz-in-a-single-step-on-windows-with-7zip
-                        command = "(New-Object System.Net.WebClient).DownloadFile('" + url + "','" + dir_path + "/download.tar.gz')"
-                        execTask('powershell -Command "' + command + '"', dir_path)
-
-                        command = '7z x "' + dir_path + '/download.tar.gz' + '" -so | 7z x -aoa -si -ttar -o"' + dir_path + '"'
-                        execTask('cmd.exe \'/C' + command, dir_path)
-                    else:
-                        command = "curl -L -o " + dir_path + "/" + package_name + ".tgz " + url
-                        execTask(command, dir_path)
-                        command = "tar -zxf " + package_name + ".tgz"
-                        execTask(command, dir_path)
+                elif type == "zip" or type == "curl-tgz":
+                    dir_path = DownloadURL(url, context, False)
     else:
         print "Repository not specified, nothing to fetch"
 
     if option_do_build:
         print "Building recipe:", package_name
-        run_recipe = get_data(recipe, 'recipe')
-        if len(run_recipe) > 0:
-            runRecipe(run_recipe, package_name, recipe, dir_name, option_do_build)
+        if has_data(recipe, "build"):
+            build_step = get_data(recipe, "build")
+            build_system = None
+            if "cmake" in build_step:
+                build_system = "cmake"
+            elif "b2" in build_step:
+                build_system = "b2"
+            if build_system == None:
+                raise RuntimeError("package {name} specifies build step but only cmake and b2 are supported at the moment".format(name=package_name))
+
+            cmake_args = []
+            b2_args = []
+
+            configurations = [ "Debug", "Release" ]
+            if "configurations" in build_step:
+                configurations = build_step["configurations"]
+
+            for config in configurations:
+                if option_do_build:
+
+                    if build_system == "cmake":           
+                        context.current_configuration = config
+                        cmake_args = substitute_variables_array(context, build_step["cmake"])
+                    elif build_system == "b2":
+                        context.current_configuration = config.lower()
+                        b2_args = substitute_variables_array(context, build_step["b2"])
+
+                    force = False
+
+                    build_dir = buildDir(context, package_name, dir_name)
+                    resolved_dir_path = dir_path
+                    if "cwd" in build_step:
+                        resolved_dir_path = os.path.join(dir_path, build_step["cwd"])
+
+                    if build_system == "cmake":
+                        RunCMake(context, resolved_dir_path, build_dir, mkvfx_root, force, config, cmake_args)
+                    elif build_system == "b2":
+                        RunB2(context, resolved_dir_path, build_dir, mkvfx_root, force, config, b2_args)
+                else:
+                    print build_system
+        else:
+            run_recipe = get_data(recipe, 'recipe')
+            if len(run_recipe) > 0:
+                runRecipe(context, run_recipe, package_name, recipe, dir_name, option_do_build)
 
     if option_do_install:
         print "Installing", package_name
         run_install = get_data(recipe, 'install')
         if len(run_install) > 0:
-            runRecipe(run_install, package_name, recipe, dir_name, option_do_install)
+            runRecipe(context, run_install, package_name, recipe, dir_name, option_do_install)
 
     built_packages.append(package_name)
 
+
+
+
+
+# Program starts here
+
+
+validate_tool_chain()
+
+class RecordLibAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        global to_build
+        to_build = values;
+
+cl_parser = argparse.ArgumentParser(description='mkvfx')
+cl_parser.add_argument('lib', action=RecordLibAction, nargs='*', help="library to build")
+cl_parser.add_argument('-nf', '--nofetch', dest='nofetch', action='store_const', const=1, default=0, help="don't fetch repository")
+cl_parser.add_argument('-nb', '--nobuild', dest='nobuild', action='store_const', const=1, default=0, help="don't build")
+cl_parser.add_argument('-nd', '--nodependencies', dest='nodependencies', action='store_const', const=1, default=0, help="don't process dependencies")
+cl_parser.add_argument('-nfd', dest='nfd', action='store_const', const=1, default=0, help="don't fetch repository or process dependencies")
+cl_parser.add_argument('-ni', '--noinstall', dest='noinstall', action='store_const', const=1, default=0, help="don't install")
+cl_parser.add_argument('-a', '--all', dest='all', action='store_const', const=1, default=0, help="process everything in the recipe file")
+cl_parser.add_argument('--force', dest='force', action='store_const', const=1, default=0, help="force rebuild")
+
+group = cl_parser.add_argument_group(title="Directories")
+group.add_argument("--src", type=str,
+                   help=("Directory where dependencies will be downloaded "
+                         "(default: <install_dir>/src)"))
+
+args = cl_parser.parse_args()
+
+if args.nofetch or args.nfd:
+    option_do_fetch = 0
+if args.nobuild:
+    option_do_build = 0
+if args.nodependencies or args.nfd:
+    option_do_dependencies = 0
+if args.noinstall:
+    option_do_install = 0
+if args.all:
+    option_build_all = 1
+if args.force:
+    option_force_build = 1
+
+#-----------------------------------------------------
+# Directory set up
+#-----------------------------------------------------
+
+cwd = os.getcwd()
+home = userHome()
+mkvfx_root = cwd
+mkvfx_build_root = home + "/mkvfx-build"
+
+class InstallContext:
+    def __init__(self, args):
+        # Directory where dependencies will be downloaded and extracted
+        self.srcDir = (os.path.abspath(args.src) if args.src
+                       else home + "/mkvfx-sources")
+        self.current_configuration = "Release"
+
+context = InstallContext(args)
+
+
+#-----------------------------------------------------
+# Platform detection
+#-----------------------------------------------------
+
+# when other platforms are tested, this should be a platform detection block
+# resolving to recipe_osx, recipe_darwin, recipe_linux, recipe_windows, recipe_ios, etc.
+
+if MacOS():
+    build_platform = "osx"
+    platform_compiler = "clang"
+    recipes_file = "recipes-osx64.json"
+
+if Windows():
+    if not 'DXSDK_DIR' in os.environ:
+        os.environ['DXSDK_DIR'] = ' ' # Some cmake recipes still believe in this obsolete variable
+
+    recipes_file = "recipes-win64.json"
+    build_platform = "windows"
+    platform_compiler = "vs2015"
+
+if build_platform == "":
+    print "Platform ", platform.system(), "not supported"
+    sys.exit(1)
+
+platform_recipe = "recipe_" + build_platform
+platform_install = "install_" + build_platform
+platform_dependencies = "dependencies_" + build_platform
+
+
+create_directory_structure(mkvfx_root, context.srcDir, mkvfx_build_root)
 
 # sys.path[0] is the directory the script is located in
 recipe_path = sys.path[0] + '/lib/' + recipes_file
@@ -528,7 +831,7 @@ if len(to_build) == 0:
 print "Fetch %d Build %d Dependencies %d Install %d All %d" % (option_do_fetch, option_do_build, option_do_dependencies, option_do_install, option_build_all)
 print "Building:\n", to_build
 
-manifest_file_path = substitute_variables('$(MKVFX_ROOT)/mkvfx-manifest.json')
+manifest_file_path = substitute_variables(context, '$(MKVFX_ROOT)/mkvfx-manifest.json')
 try:
     manifest_file = open(manifest_file_path, 'r')
     data = manifest_file.read()
@@ -539,10 +842,10 @@ except:
 
 if option_build_all:
     for package in lower_case_map:
-        bake(package)
+        bake(context, package)
 else:
     for package in to_build:
-        bake(package)
+        bake(context, package)
 
 manifest_file = open(manifest_file_path, 'w')
 manifest_file.write(json.dumps(built_packages, sort_keys=True))
